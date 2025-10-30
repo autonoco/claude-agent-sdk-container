@@ -2,9 +2,6 @@ import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { createNodeWebSocket } from "@hono/node-ws";
-import { getCookie, setCookie } from "hono/cookie";
-import { SignJWT, jwtVerify } from "jose";
-import { githubAuth } from "@hono/oauth-providers/github";
 import { query, type CanUseTool } from "@anthropic-ai/claude-agent-sdk";
 import fs from "fs";
 import { verifyToken } from '@clerk/backend'
@@ -13,7 +10,6 @@ import dotenv from 'dotenv'
 dotenv.config()
 
 // Environment setup
-const SECRET = new TextEncoder().encode(process.env.SESSION_SECRET || "devdevdev");
 const PORT = process.env.PORT || 8080;
 
 // Auto-allow all tool uses (no permission prompts)
@@ -21,10 +17,6 @@ const allowAll: CanUseTool = async (_toolName, input) => ({
   behavior: 'allow',
   updatedInput: input,
 });
-
-// GitHub allowlist configuration
-const allowedGithubUsers = process.env.ALLOWED_GITHUB_USERS?.split(',').map(u => u.trim().toLowerCase()) || [];
-const allowedGithubOrg = process.env.ALLOWED_GITHUB_ORG?.trim().toLowerCase() || '';
 
 // Check if running in Docker (skip check in test mode)
 if (process.env.NODE_ENV !== 'test') {
@@ -40,62 +32,14 @@ if (process.env.NODE_ENV !== 'test') {
     process.exit(1);
   }
 
-  // Check GitHub allowlist configuration (required for security)
-  if (allowedGithubUsers.length === 0 && !allowedGithubOrg) {
-    console.error("\n❌ ERROR: GitHub access control must be configured!");
+  // Check Clerk configuration (required for security)
+  if (!process.env.CLERK_SECRET_KEY) {
+    console.error("\n❌ ERROR: Clerk authentication must be configured!");
     console.error("\n🔐 Security Requirement:");
-    console.error("You must configure at least one of these environment variables:");
-    console.error("- ALLOWED_GITHUB_USERS=user1,user2,user3");
-    console.error("- ALLOWED_GITHUB_ORG=yourcompany");
+    console.error("You must configure the CLERK_SECRET_KEY environment variable.");
     console.error("\nThis prevents unauthorized access to your Claude instance.\n");
     process.exit(1);
   }
-}
-
-// GitHub user validation function
-function isGithubUserAllowed(githubUser: any): boolean {
-  if (!githubUser?.login) return false;
-
-  const username = githubUser.login.toLowerCase();
-
-  // Check username allowlist
-  if (allowedGithubUsers.length > 0 && allowedGithubUsers.includes(username)) {
-    return true;
-  }
-
-  // Check organization membership (this would need GitHub API call in production)
-  // For now, we'll just check if the user belongs to allowed org via their company field
-  if (allowedGithubOrg && githubUser.company) {
-    const userOrg = githubUser.company.toLowerCase().replace(/[@\s]/g, '');
-    return userOrg.includes(allowedGithubOrg);
-  }
-
-  return false;
-}
-
-
-// JWT utilities
-async function setSessionCookie(c: any, githubUser: any) {
-  const token = await new SignJWT({
-    sub: githubUser.login,
-    username: githubUser.login,
-    id: githubUser.id,
-    email: githubUser.email,
-    name: githubUser.name,
-    avatar_url: githubUser.avatar_url
-  })
-    .setProtectedHeader({ alg: "HS256" })
-    .setIssuedAt()
-    .setExpirationTime('3600s')
-    .sign(SECRET);
-
-  setCookie(c, 'sid', token, {
-    path: "/",
-    maxAge: 3600,
-    httpOnly: true,
-    secure: true,
-    sameSite: "Lax"
-  });
 }
 
 // API key auth helper
@@ -141,10 +85,7 @@ if (process.env.NODE_ENV !== 'test') {
   console.log("Environment:", isDocker ? "Docker" : "Local");
   console.log("Anthropic API key:", !!(process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_CODE_OAUTH_TOKEN) ? "✓" : "✗");
   console.log("API protection:", !!process.env.CLAUDE_AGENT_SDK_CONTAINER_API_KEY ? "✓" : "✗");
-  console.log("GitHub OAuth:", !!process.env.GITHUB_CLIENT_ID && !!process.env.GITHUB_CLIENT_SECRET ? "✓" : "✗");
-  console.log("Clerk Secret:", !!process.env.CLERK_SECRET_KEY ? process.env.CLERK_SECRET_KEY : "✗");
-  if (allowedGithubUsers.length > 0) console.log("GitHub users allowlist:", allowedGithubUsers.length, "users");
-  if (allowedGithubOrg) console.log("GitHub org restriction:", allowedGithubOrg);
+  console.log("Clerk Secret:", !!process.env.CLERK_SECRET_KEY ? "✓" : "✗");
 }
 
 // Health check endpoint
@@ -163,10 +104,23 @@ app.get("/health", (c) => {
 
 // Serve React SPA at root for browser requests (skip in test mode)
 if (process.env.NODE_ENV !== 'test') {
-  app.get("/", serveStatic({
-    root: './web/dist',
-    path: './index.html'
-  }));
+  app.get("/", async (c) => {
+    const staticHandler = serveStatic({
+      root: './web/dist',
+      path: './index.html'
+    });
+    const response = await staticHandler(c, async () => {});
+
+    if (response) {
+      // Inject Clerk publishable key into HTML
+      let html = await response.text();
+      html = html.replace('{{CLERK_PUBLISHABLE_KEY}}', process.env.CLERK_PUBLISHABLE_KEY || '');
+
+      return c.html(html);
+    }
+
+    return c.text('Not found', 404);
+  });
 }
 
 // Legacy query endpoint (REST API with API key auth)
@@ -258,83 +212,27 @@ Format the response to show each agent's perspective clearly, then provide a sum
   }
 });
 
-// GitHub App configuration and setup
-app.use('/auth/github', (c, next) => {
-  // Detect protocol from standard headers used by proxies/load balancers
-  const xForwardedProto = c.req.header('x-forwarded-proto');
-  const xForwardedSsl = c.req.header('x-forwarded-ssl');
-  const xUrlScheme = c.req.header('x-url-scheme');
+// Clerk session verification endpoint
+app.get('/auth/verify', async (c) => {
+  const authHeader = c.req.header('authorization');
 
-  // Use HTTPS if any common proxy header indicates it
-  const protocol = (
-    xForwardedProto === 'https' ||
-    xForwardedSsl === 'on' ||
-    xUrlScheme === 'https' ||
-    process.env.NODE_ENV === 'production'
-  ) ? 'https' : 'http';
-
-  const host = c.req.header('host') || 'localhost:8080';
-  const redirectUri = `${protocol}://${host}/auth/github`;
-
-  return githubAuth({
-    client_id: process.env.GITHUB_CLIENT_ID!,
-    client_secret: process.env.GITHUB_CLIENT_SECRET!,
-    scope: ['read:user', 'user:email'],
-    redirect_uri: redirectUri,
-    // oauthApp: false is default for GitHub Apps
-  })(c, next);
-});
-
-// GitHub OAuth callback
-app.get('/auth/github', async (c) => {
-  const token = c.get('token');
-  const user = c.get('user-github');
-
-  if (!user) {
-    return c.text('GitHub authentication failed', 400);
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return c.json({ error: 'No token provided' }, 401);
   }
 
-  // Check if user is allowed
-  if (!isGithubUserAllowed(user)) {
-    return c.text('GitHub user not authorized', 403);
-  }
-
-  // Set session cookie
-  await setSessionCookie(c, user);
-
-  // Redirect to main app
-  c.status(302);
-  c.header('Location', '/');
-  return c.body(null);
-});
-
-// Auth: ping (check if authenticated)
-app.on(['GET', 'HEAD'], "/auth/verify-ping", async (c) => {
-  const val = getCookie(c, 'sid');
-  if (!val) return c.body(null, 401);
-  try {
-    await jwtVerify(val, SECRET);
-    return c.body(null, 200);
-  } catch {
-    return c.body(null, 401);
-  }
-});
-
-// Auth: user info (get current user data)
-app.get('/auth/user', async (c) => {
-  const val = getCookie(c, 'sid');
-  if (!val) return c.json({ error: 'Not authenticated' }, 401);
+  const token = authHeader.substring(7);
 
   try {
-    const { payload } = await jwtVerify(val, SECRET);
-    return c.json({
-      username: payload.username,
-      name: payload.name,
-      email: payload.email,
-      avatar_url: payload.avatar_url
+    const result = await verifyToken(token, {
+      secretKey: process.env.CLERK_SECRET_KEY,
     });
-  } catch {
-    return c.json({ error: 'Invalid session' }, 401);
+
+    return c.json({
+      verified: true,
+      userId: result.sub
+    });
+  } catch (error: any) {
+    return c.json({ error: 'Invalid token' }, 401);
   }
 });
 
@@ -521,7 +419,6 @@ if (process.env.NODE_ENV !== 'test') {
   }, (info) => {
     console.log(`Server listening on ${info.address}:${info.port}`);
     console.log(`Web CLI: http://localhost:${info.port}`);
-    console.log(`GitHub OAuth: http://localhost:${info.port}/auth/github`);
     console.log(`API: POST http://localhost:${info.port}/query`);
   });
 

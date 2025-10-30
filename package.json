@@ -22,10 +22,8 @@
     "@clerk/backend": "^2.19.1",
     "@hono/node-server": "^1.0.0",
     "@hono/node-ws": "^1.0.0",
-    "@hono/oauth-providers": "^0.6.0",
     "dotenv": "^17.2.3",
     "hono": "^4.0.0",
-    "jose": "^6.1.0",
     "tsx": "^4.0.0"
   },
   "devDependencies": {

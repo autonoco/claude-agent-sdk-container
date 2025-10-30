@@ -1,91 +1,68 @@
 import { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { ClerkProvider, SignInButton, SignedIn, SignedOut, useAuth, UserButton } from "@clerk/clerk-react";
 
-function Login() {
-  return (
-    <div
-      style={{
-        maxWidth: 420,
-        margin: "15vh auto",
-        fontFamily: "system-ui",
-        textAlign: "center",
-      }}
-    >
-      <div style={{ marginBottom: 32 }}>
-        <h1 style={{ fontSize: 28, marginBottom: 8, color: "#fff" }}>
-          Claude CLI
-        </h1>
-        <p style={{ color: "#888", margin: 0 }}>
-          Containerized Claude Code with browser interface
-        </p>
-      </div>
-
-      <button
-        onClick={() => (window.location.href = "/auth/github")}
-        style={{
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          gap: 12,
-          width: "100%",
-          padding: "16px 24px",
-          background: "#24292e",
-          color: "#fff",
-          border: "none",
-          borderRadius: 6,
-          fontSize: 16,
-          fontWeight: 500,
-          cursor: "pointer",
-          transition: "background-color 0.2s",
-        }}
-        onMouseOver={(e) => (e.currentTarget.style.background = "#2f363d")}
-        onMouseOut={(e) => (e.currentTarget.style.background = "#24292e")}
-      >
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
-          <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z" />
-        </svg>
-        Sign in with GitHub
-      </button>
-
-      <p
-        style={{ color: "#666", marginTop: 24, fontSize: 14, lineHeight: 1.5 }}
-      >
-        Sign in with your GitHub account to access the Claude CLI interface.
-      </p>
-    </div>
-  );
-}
+// Clerk publishable key will be injected by the server at runtime
+// @ts-ignore - This is replaced by the server
+const CLERK_PUBLISHABLE_KEY = window.CLERK_PUBLISHABLE_KEY || "pk_test_placeholder";
 
 function CLI() {
+  const { getToken } = useAuth();
   const [connected, setConnected] = useState(false);
   const [input, setInput] = useState("");
   const preRef = useRef<HTMLPreElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
 
   useEffect(() => {
-    const ws = new WebSocket(
-      (location.protocol === "https:" ? "wss://" : "ws://") +
-        location.host +
-        "/ws",
-    );
-    wsRef.current = ws;
+    let ws: WebSocket;
 
-    ws.onopen = () => {
-      setConnected(true);
-      log("✔ Connected to Claude CLI\n");
+    const initWebSocket = async () => {
+      // Get Clerk session token
+      const token = await getToken();
+
+      if (!token) {
+        log("✖ No authentication token\n");
+        return;
+      }
+
+      ws = new WebSocket(
+        (location.protocol === "https:" ? "wss://" : "ws://") +
+          location.host +
+          "/ws",
+      );
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        setConnected(true);
+        log("✔ Connected to Claude CLI\n");
+        // Send token for verification
+        ws.send(JSON.stringify({ token }));
+      };
+
+      ws.onclose = () => {
+        setConnected(false);
+        log("✖ Disconnected\n");
+      };
+
+      ws.onmessage = (e) => {
+        const msg = JSON.parse(e.data);
+        if (msg.type === "text") log(msg.chunk);
+        if (msg.type === "done") log("\n");
+        if (msg.type === "ready") log("Ready for your questions...\n\n");
+        if (msg.type === "tokenVerified") {
+          if (msg.success) {
+            log("✔ Authentication verified\n\n");
+          } else {
+            log("✖ Authentication failed\n");
+          }
+        }
+        if (msg.type === "error") {
+          log(`✖ Error: ${msg.message}\n`);
+        }
+      };
     };
 
-    ws.onclose = () => {
-      setConnected(false);
-      log("✖ Disconnected\n");
-    };
-
-    ws.onmessage = (e) => {
-      const msg = JSON.parse(e.data);
-      if (msg.type === "text") log(msg.chunk);
-      if (msg.type === "done") log("\n");
-      if (msg.type === "ready") log("Ready for your questions...\n\n");
-    };
+    initWebSocket();
 
     function log(s: string) {
       if (!preRef.current) return;
@@ -93,8 +70,10 @@ function CLI() {
       preRef.current.scrollTop = preRef.current.scrollHeight;
     }
 
-    return () => ws.close();
-  }, []);
+    return () => {
+      if (ws) ws.close();
+    };
+  }, [getToken]);
 
   const send = () => {
     if (!input.trim() || !connected) return;
@@ -112,7 +91,7 @@ function CLI() {
     <div
       style={{
         display: "grid",
-        gridTemplateRows: "1fr auto",
+        gridTemplateRows: "auto 1fr auto",
         height: "100vh",
         fontFamily:
           "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
@@ -123,6 +102,21 @@ function CLI() {
         bottom: 0,
       }}
     >
+      {/* Header with UserButton */}
+      <div
+        style={{
+          padding: "8px 12px",
+          borderBottom: "1px solid #222",
+          background: "#111",
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+        }}
+      >
+        <span style={{ color: "#888", fontSize: "14px" }}>Claude CLI</span>
+        <UserButton afterSignOutUrl="/" />
+      </div>
+
       <pre
         ref={preRef}
         style={{
@@ -187,35 +181,6 @@ function CLI() {
 }
 
 function App() {
-  const [authed, setAuthed] = useState<boolean | null>(null);
-
-  useEffect(() => {
-    fetch("/auth/verify-ping", { method: "HEAD" })
-      .then((r) => setAuthed(r.ok))
-      .catch(() => setAuthed(false));
-  }, []);
-
-  if (authed === null) {
-    return (
-      <div
-        style={{
-          padding: 20,
-          fontFamily: "system-ui",
-          display: "flex",
-          justifyContent: "center",
-          alignItems: "center",
-          height: "100vh",
-          background: "#0b0b0b",
-          color: "#e6e6e6",
-        }}
-      >
-        Loading...
-      </div>
-    );
-  }
-
-  if (authed) return <CLI />;
-
   return (
     <div
       style={{
@@ -224,9 +189,71 @@ function App() {
         color: "#e6e6e6",
       }}
     >
-      <Login />
+      <SignedOut>
+        <div
+          style={{
+            maxWidth: 420,
+            margin: "15vh auto",
+            fontFamily: "system-ui",
+            textAlign: "center",
+          }}
+        >
+          <div style={{ marginBottom: 32 }}>
+            <h1 style={{ fontSize: 28, marginBottom: 8, color: "#fff" }}>
+              Claude CLI
+            </h1>
+            <p style={{ color: "#888", margin: 0 }}>
+              Containerized Claude Code with browser interface
+            </p>
+          </div>
+
+          <SignInButton mode="modal">
+            <button
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                gap: 12,
+                width: "100%",
+                padding: "16px 24px",
+                background: "#6C47FF",
+                color: "#fff",
+                border: "none",
+                borderRadius: 6,
+                fontSize: 16,
+                fontWeight: 500,
+                cursor: "pointer",
+                transition: "background-color 0.2s",
+              }}
+              onMouseOver={(e) => (e.currentTarget.style.background = "#5639CC")}
+              onMouseOut={(e) => (e.currentTarget.style.background = "#6C47FF")}
+            >
+              Sign in with Clerk
+            </button>
+          </SignInButton>
+
+          <p
+            style={{
+              color: "#666",
+              marginTop: 24,
+              fontSize: 14,
+              lineHeight: 1.5,
+            }}
+          >
+            Sign in to access the Claude CLI interface.
+          </p>
+        </div>
+      </SignedOut>
+
+      <SignedIn>
+        <CLI />
+      </SignedIn>
     </div>
   );
 }
 
-createRoot(document.getElementById("root")!).render(<App />);
+createRoot(document.getElementById("root")!).render(
+  <ClerkProvider publishableKey={CLERK_PUBLISHABLE_KEY}>
+    <App />
+  </ClerkProvider>
+);

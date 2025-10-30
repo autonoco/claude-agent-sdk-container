@@ -28,6 +28,10 @@
   </head>
   <body>
     <div id="root"></div>
+    <script>
+      // Clerk publishable key injected by server
+      window.CLERK_PUBLISHABLE_KEY = "{{CLERK_PUBLISHABLE_KEY}}";
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
