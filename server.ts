@@ -7,8 +7,10 @@ import { SignJWT, jwtVerify } from "jose";
 import { githubAuth } from "@hono/oauth-providers/github";
 import { query, type CanUseTool } from "@anthropic-ai/claude-agent-sdk";
 import fs from "fs";
-import os from "os";
-import path from "path";
+import { verifyToken } from '@clerk/backend'
+import dotenv from 'dotenv'
+
+dotenv.config()
 
 // Environment setup
 const SECRET = new TextEncoder().encode(process.env.SESSION_SECRET || "devdevdev");
@@ -107,14 +109,15 @@ function checkApiAuth(c: any): boolean {
 
 // WebSocket auth helper
 async function checkWSAuth(c: any): Promise<boolean> {
-  const val = getCookie(c, 'sid');
-  if (!val) return false;
-  try {
-    await jwtVerify(val, SECRET);
-    return true;
-  } catch {
-    return false;
-  }
+  // const val = getCookie(c, 'sid');
+  // if (!val) return false;
+  // try {
+  //   await jwtVerify(val, SECRET);
+  //   return true;
+  // } catch {
+  //   return false;
+  // }
+  return true;
 }
 
 export const app = new Hono();
@@ -126,6 +129,11 @@ const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });
 // The Claude SDK returns a new session ID with each response that must be used to resume the conversation
 const sessionIds = new Map<any, string>();
 
+// Token verification store (keyed by WebSocket connection)
+// Tracks whether each connection has been authenticated with a valid token
+const tokenVerified = new Map<any, boolean>();
+
+
 // Startup logging (skip in test mode)
 if (process.env.NODE_ENV !== 'test') {
   const isDocker = fs.existsSync('/.dockerenv') || process.env.container === 'docker';
@@ -134,6 +142,7 @@ if (process.env.NODE_ENV !== 'test') {
   console.log("Anthropic API key:", !!(process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_CODE_OAUTH_TOKEN) ? "✓" : "✗");
   console.log("API protection:", !!process.env.CLAUDE_AGENT_SDK_CONTAINER_API_KEY ? "✓" : "✗");
   console.log("GitHub OAuth:", !!process.env.GITHUB_CLIENT_ID && !!process.env.GITHUB_CLIENT_SECRET ? "✓" : "✗");
+  console.log("Clerk Secret:", !!process.env.CLERK_SECRET_KEY ? process.env.CLERK_SECRET_KEY : "✗");
   if (allowedGithubUsers.length > 0) console.log("GitHub users allowlist:", allowedGithubUsers.length, "users");
   if (allowedGithubOrg) console.log("GitHub org restriction:", allowedGithubOrg);
 }
@@ -332,13 +341,15 @@ app.get('/auth/user', async (c) => {
 // WebSocket handler - exported for testing
 export const websocketHandler = (c: any) => ({
   onOpen: async (event: any, ws: any) => {
+    console.log("connected")
     const ok = await checkWSAuth(c);
     if (!ok) {
       ws.close();
       return;
     }
-    // Initialize session tracking for this connection
+    // Initialize session tracking and token verification for this connection
     sessionIds.set(ws, "");
+    tokenVerified.set(ws, false);
     ws.send(JSON.stringify({ type: "ready" }));
   },
 
@@ -347,6 +358,43 @@ export const websocketHandler = (c: any) => ({
     try {
       data = JSON.parse(String(event.data));
     } catch {
+      return;
+    }
+
+
+    // Handle token verification
+    if (!!data.token) {
+
+      try {
+        console.log('sec', process.env.CLERK_SECRET_KEY)
+        const result =  await verifyToken(data.token, {
+          secretKey: process.env.CLERK_SECRET_KEY,
+        });
+        
+        tokenVerified.set(ws, true);
+          ws.send(JSON.stringify({
+            type: "tokenVerified",
+            success: true,
+            result
+          }));
+        
+      } catch (error: any) {
+        console.error("Token verification error:", error.message);
+        ws.send(JSON.stringify({
+          type: "error",
+          message: "Token verification failed"
+        }));
+      }
+      return;
+    }
+
+    // Check if token has been verified before allowing prompt
+    const isVerified = tokenVerified.get(ws);
+    if (!isVerified) {
+      ws.send(JSON.stringify({
+        type: "error",
+        message: "Not authenticated."
+      }));
       return;
     }
 
@@ -428,8 +476,9 @@ export const websocketHandler = (c: any) => ({
   },
 
   onClose: (event: any, ws: any) => {
-    // Clean up session ID when connection closes
+    // Clean up session ID and token verification when connection closes
     sessionIds.delete(ws);
+    tokenVerified.delete(ws);
   }
 });
 
